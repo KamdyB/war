@@ -5,17 +5,18 @@ import time
 import cv2
 import mediapipe as mp
 import pandas as pd
+import numpy as np
 
 from collections import deque
+from pathlib import Path
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
-
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-MODEL_PATH = "models/hand_landmarker.task"
+MODEL_PATH = Path(__file__).resolve().parent / "models" / "hand_landmarker.task"
 MAX_HANDS = 1
 
 # Pinch detection
@@ -414,7 +415,7 @@ def draw_table(frame, dataframe, selected_column, scroll_offset):
             value = row[column]
 
             if pd.isna(value):
-                display_value = "—"
+                display_value = "-"
             else:
                 display_value = str(value)
 
@@ -758,7 +759,7 @@ def update_scroll(
             MAX_SCROLL_STEP
         )
 
-        scroll_offset -= int(rows_to_scroll)
+        scroll_offset += int(rows_to_scroll)
 
         scroll_accumulator -= (
             rows_to_scroll * SCROLL_PIXELS_PER_ROW
@@ -795,7 +796,6 @@ def main():
     # Load CSV
     try:
         dataframe = pd.read_csv(args.csv_path)
-
     except Exception as error:
         print(f"Could not load CSV file: {error}")
         return
@@ -814,17 +814,12 @@ def main():
 
     # Initial selected column: first numeric column, if available
     numeric_columns = get_numeric_columns(dataframe)
-
-    selected_column = (
-        numeric_columns[0]
-        if numeric_columns
-        else None
-    )
+    selected_column = numeric_columns[0] if numeric_columns else None
 
     # Load MediaPipe model
     try:
         base_options = python.BaseOptions(
-            model_asset_path=MODEL_PATH
+            model_asset_path=str(MODEL_PATH)
         )
 
         options = vision.HandLandmarkerOptions(
@@ -833,9 +828,7 @@ def main():
             num_hands=MAX_HANDS
         )
 
-        detector = vision.HandLandmarker.create_from_options(
-            options
-        )
+        detector = vision.HandLandmarker.create_from_options(options)
 
     except Exception as error:
         print(f"Could not load hand tracking model: {error}")
@@ -856,10 +849,9 @@ def main():
     # Gesture state
     pinch_state = False
     previous_pinch_state = False
+    pinch_start_region = None
 
-    midpoint_history = deque(
-        maxlen=SMOOTHING_WINDOW
-    )
+    midpoint_history = deque(maxlen=SMOOTHING_WINDOW)
 
     previous_cursor = None
     scroll_accumulator = 0
@@ -868,172 +860,155 @@ def main():
     previous_time = time.time()
     timestamp_ms = 0
 
-    cv2.namedWindow(
-        WINDOW_NAME,
-        cv2.WINDOW_NORMAL
-    )
-
-    cv2.resizeWindow(
-        WINDOW_NAME,
-        WINDOW_WIDTH,
-        WINDOW_HEIGHT
-    )
-
     print("Dashboard started.")
     print("Pinch a column header to select it.")
-    print("Pinch and drag vertically over the table to scroll.")
+    print("Pinch and drag vertically from the table body to scroll.")
+    print("Drag upward to see later rows; drag downward to return.")
     print("Press Q to quit.")
 
-    # ========================================================
-    # MAIN LOOP
-    # ========================================================
-
-    while cap.isOpened():
-        success, camera_frame = cap.read()
-
-        if not success:
-            print("Could not read webcam frame.")
-            break
-
-        camera_frame = cv2.resize(
-            camera_frame,
-            (960, 540)
-        )
-
-        # MediaPipe receives the unmirrored image
-        rgb_frame = cv2.cvtColor(
-            camera_frame,
-            cv2.COLOR_BGR2RGB
-        )
-
-        mp_image = mp.Image(
-            image_format=mp.ImageFormat.SRGB,
-            data=rgb_frame
-        )
-
-        timestamp_ms = max(
-            timestamp_ms + 1,
-            int(time.monotonic() * 1000)
-        )
-
-        result = detector.detect_for_video(
-            mp_image,
-            timestamp_ms
-        )
-
-        # Mirrored camera preview
-        webcam_frame = cv2.flip(
-            camera_frame,
-            1
-        )
-
-        # Dashboard canvas
-        dashboard = (
-            pd.np.zeros(
-                (WINDOW_HEIGHT, WINDOW_WIDTH, 3),
-                dtype="uint8"
-            )
-            if hasattr(pd, "np")
-            else __import__("numpy").zeros(
-                (WINDOW_HEIGHT, WINDOW_WIDTH, 3),
-                dtype="uint8"
-            )
-        )
-
-        draw_dashboard_background(dashboard)
-
-        # Draw table and get clickable header regions
-        header_regions = draw_table(
-            dashboard,
-            dataframe,
-            selected_column,
-            scroll_offset
-        )
-
-        # Draw selected column chart
-        draw_chart(
-            dashboard,
-            dataframe,
-            selected_column
-        )
-
-        # Cursor state for this frame
-        cursor_x = None
-        cursor_y = None
+    try:
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WINDOW_NAME, WINDOW_WIDTH, WINDOW_HEIGHT)
 
         # ====================================================
-        # HAND PROCESSING
+        # MAIN LOOP
         # ====================================================
 
-        if result.hand_landmarks:
-            landmarks = result.hand_landmarks[0]
+        while cap.isOpened():
+            success, camera_frame = cap.read()
 
-            draw_hand(
-                webcam_frame,
-                landmarks
+            if not success:
+                print("Could not read webcam frame.")
+                break
+
+            camera_frame = cv2.resize(
+                camera_frame,
+                (960, 540)
             )
 
-            pinch_ratio = calculate_pinch_ratio(
-                landmarks
+            # Create exactly one dashboard canvas per frame.
+            dashboard = np.zeros(
+                (WINDOW_HEIGHT, WINDOW_WIDTH, 3),
+                dtype=np.uint8
             )
 
-            previous_pinch_state = pinch_state
-
-            pinch_state = update_pinch_state(
-                pinch_ratio,
-                pinch_state
+            # MediaPipe receives the unmirrored image.
+            rgb_frame = cv2.cvtColor(
+                camera_frame,
+                cv2.COLOR_BGR2RGB
             )
 
-            pinch_started = (
-                pinch_state and not previous_pinch_state
+            mp_image = mp.Image(
+                image_format=mp.ImageFormat.SRGB,
+                data=rgb_frame
             )
 
-            midpoint = calculate_midpoint(
-                landmarks
+            timestamp_ms = max(
+                timestamp_ms + 1,
+                int(time.monotonic() * 1000)
             )
 
-            smoothed = smooth_midpoint(
-                midpoint,
-                midpoint_history
+            result = detector.detect_for_video(
+                mp_image,
+                timestamp_ms
             )
 
-            # Convert to mirrored webcam coordinates
-            normalised_x = 1.0 - smoothed[0]
-            normalised_y = smoothed[1]
+            # Mirrored camera preview
+            webcam_frame = cv2.flip(camera_frame, 1)
 
-            # Map to the full dashboard
-            cursor_x, cursor_y = map_webcam_to_dashboard(
-                normalised_x,
-                normalised_y
+            draw_dashboard_background(dashboard)
+
+            # Draw table and get clickable header regions.
+            header_regions = draw_table(
+                dashboard,
+                dataframe,
+                selected_column,
+                scroll_offset
             )
 
-            # Select a column only when a pinch starts
-            if pinch_started:
-                header_column = find_header_at_position(
-                    cursor_x,
-                    cursor_y,
-                    header_regions
+            # Draw selected column chart.
+            draw_chart(
+                dashboard,
+                dataframe,
+                selected_column
+            )
+
+            cursor_x = None
+            cursor_y = None
+
+            # =================================================
+            # HAND PROCESSING
+            # =================================================
+
+            if result.hand_landmarks:
+                landmarks = result.hand_landmarks[0]
+                draw_hand(webcam_frame, landmarks)
+
+                pinch_ratio = calculate_pinch_ratio(landmarks)
+
+                previous_pinch_state = pinch_state
+                pinch_state = update_pinch_state(
+                    pinch_ratio,
+                    pinch_state
                 )
 
-                if header_column is not None:
-                    selected_column = header_column
+                pinch_started = (
+                    pinch_state and not previous_pinch_state
+                )
+                pinch_released = (
+                    previous_pinch_state and not pinch_state
+                )
 
-                    print(
-                        f"Selected column: {selected_column}"
+                midpoint = calculate_midpoint(landmarks)
+                smoothed = smooth_midpoint(
+                    midpoint,
+                    midpoint_history
+                )
+
+                # Convert to mirrored webcam coordinates.
+                normalised_x = 1.0 - smoothed[0]
+                normalised_y = smoothed[1]
+
+                # Map the cursor to the full dashboard.
+                cursor_x, cursor_y = map_webcam_to_dashboard(
+                    normalised_x,
+                    normalised_y
+                )
+
+                # Latch the region where this pinch began.
+                if pinch_started:
+                    header_column = find_header_at_position(
+                        cursor_x,
+                        cursor_y,
+                        header_regions
                     )
 
-            # Scroll while pinched and over the table body
-            if pinch_state and is_over_table_body(
-                cursor_x,
-                cursor_y
-            ):
-                if previous_cursor is not None:
+                    if header_column is not None:
+                        pinch_start_region = "header"
+                        selected_column = header_column
+                        print(f"Selected column: {selected_column}")
+
+                    elif is_over_table_body(cursor_x, cursor_y):
+                        pinch_start_region = "table_body"
+                        previous_cursor = (cursor_x, cursor_y)
+                        scroll_accumulator = 0
+
+                    else:
+                        pinch_start_region = "other"
+                        previous_cursor = None
+                        scroll_accumulator = 0
+
+                # Scroll only when the pinch STARTED in the table body.
+                # Keep the cursor over the table while dragging.
+                if (
+                    pinch_state
+                    and pinch_start_region == "table_body"
+                    and is_over_table_body(cursor_x, cursor_y)
+                    and previous_cursor is not None
+                ):
                     previous_cursor_y = previous_cursor[1]
 
-                    (
-                        scroll_offset,
-                        scroll_accumulator
-                    ) = update_scroll(
+                    scroll_offset, scroll_accumulator = update_scroll(
                         cursor_y,
                         previous_cursor_y,
                         scroll_offset,
@@ -1041,119 +1016,106 @@ def main():
                         scroll_accumulator
                     )
 
-            # Reset scroll tracking when not pinching
-            if not pinch_state:
+                if pinch_state and pinch_start_region == "table_body":
+                    # Track movement while the table-body gesture is active.
+                    previous_cursor = (cursor_x, cursor_y)
+
+                if pinch_released:
+                    pinch_start_region = None
+                    previous_cursor = None
+                    scroll_accumulator = 0
+
+                cursor_color = (
+                    PINCH_COLOR if pinch_state else CURSOR_COLOR
+                )
+
+                cv2.circle(
+                    dashboard,
+                    (cursor_x, cursor_y),
+                    12,
+                    cursor_color,
+                    2
+                )
+
+                cv2.circle(
+                    dashboard,
+                    (cursor_x, cursor_y),
+                    3,
+                    cursor_color,
+                    -1
+                )
+
+                cv2.putText(
+                    dashboard,
+                    f"PINCH: {'ON' if pinch_state else 'OFF'}",
+                    (WINDOW_WIDTH - 220, 45),
+                    FONT,
+                    BODY_FONT_SCALE,
+                    cursor_color,
+                    1
+                )
+
+                cv2.putText(
+                    dashboard,
+                    f"Ratio: {pinch_ratio:.3f}",
+                    (WINDOW_WIDTH - 220, 70),
+                    FONT,
+                    SMALL_FONT_SCALE,
+                    MUTED_TEXT,
+                    1
+                )
+
+            else:
+                # No hand detected: reset active gesture state.
+                pinch_state = False
+                previous_pinch_state = False
+                pinch_start_region = None
+                previous_cursor = None
+                midpoint_history.clear()
                 scroll_accumulator = 0
 
-            # Dashboard cursor
-            cursor_color = (
-                PINCH_COLOR
-                if pinch_state
-                else CURSOR_COLOR
-            )
+            # =================================================
+            # FPS
+            # =================================================
 
-            cv2.circle(
-                dashboard,
-                (cursor_x, cursor_y),
-                12,
-                cursor_color,
-                2
-            )
+            current_time = time.time()
+            elapsed_time = current_time - previous_time
 
-            cv2.circle(
-                dashboard,
-                (cursor_x, cursor_y),
-                3,
-                cursor_color,
-                -1
-            )
+            fps = 1 / elapsed_time if elapsed_time > 0 else 0
+            previous_time = current_time
 
             cv2.putText(
                 dashboard,
-                f"PINCH: {'ON' if pinch_state else 'OFF'}",
-                (WINDOW_WIDTH - 220, 45),
-                FONT,
-                BODY_FONT_SCALE,
-                cursor_color,
-                1
-            )
-
-            cv2.putText(
-                dashboard,
-                f"Ratio: {pinch_ratio:.3f}",
-                (WINDOW_WIDTH - 220, 70),
+                f"FPS: {int(fps)}",
+                (WINDOW_WIDTH - 220, 100),
                 FONT,
                 SMALL_FONT_SCALE,
                 MUTED_TEXT,
                 1
             )
 
-            previous_cursor = (
-                cursor_x,
-                cursor_y
+            # =================================================
+            # CAMERA PREVIEW
+            # =================================================
+
+            draw_camera_preview(
+                dashboard,
+                webcam_frame,
+                pinch_state
             )
 
-        else:
-            # No hand detected
-            pinch_state = False
-            previous_pinch_state = False
-            previous_cursor = None
-            midpoint_history.clear()
-            scroll_accumulator = 0
+            cv2.imshow(WINDOW_NAME, dashboard)
 
-        # ====================================================
-        # FPS
-        # ====================================================
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
 
-        current_time = time.time()
-        elapsed_time = current_time - previous_time
-
-        fps = (
-            1 / elapsed_time
-            if elapsed_time > 0
-            else 0
-        )
-
-        previous_time = current_time
-
-        cv2.putText(
-            dashboard,
-            f"FPS: {int(fps)}",
-            (WINDOW_WIDTH - 220, 100),
-            FONT,
-            SMALL_FONT_SCALE,
-            MUTED_TEXT,
-            1
-        )
-
-        # ====================================================
-        # CAMERA PREVIEW
-        # ====================================================
-
-        draw_camera_preview(
-            dashboard,
-            webcam_frame,
-            pinch_state
-        )
-
-        # Display
-        cv2.imshow(
-            WINDOW_NAME,
-            dashboard
-        )
-
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord("q"):
-            break
-
-    # ========================================================
-    # CLEANUP
-    # ========================================================
-
-    cap.release()
-    detector.close()
-    cv2.destroyAllWindows()
+    finally:
+        # Always release hardware and close MediaPipe resources,
+        # including when an exception occurs in the dashboard loop.
+        cap.release()
+        detector.close()
+        cv2.destroyAllWindows()
 
     print("Dashboard closed.")
 
