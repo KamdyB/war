@@ -1,0 +1,18 @@
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+venv/
+
+# MediaPipe model files
+models/*.task
+
+# IDE
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
